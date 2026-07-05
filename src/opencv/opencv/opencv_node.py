@@ -1,25 +1,75 @@
+import os
+from pathlib import Path
+
 import cv2
 import numpy as np
 import rclpy
+import yaml
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 
 
+def get_default_vehicle_config_path():
+    for base_path in Path(__file__).resolve().parents:
+        candidate = base_path / 'src' / 'config' / 'vehicle_config.yaml'
+        if candidate.exists():
+            return str(candidate)
+    return '/home/topst/D-Racer/src/config/vehicle_config.yaml'
+
+
 class OpenCvNode(Node):
+    """카메라 압축영상을 받아 차선용 엣지영상을 발행하는 전처리 노드.
+
+    카메라는 YOLO 를 위해 640x480 으로 발행하지만, 차선 파이프라인의 ROI/px 튜닝값은
+    저해상도(LANE_PROC, 기본 320x160) 기준이다. 그래서 여기서 먼저 그 크기로
+    다운스케일한 뒤 Canny 를 돌린다 -> 차선 튜닝 보존 + Canny/인코딩 부하도 저해상도 유지.
+
+    grayscale/blur 는 디버그용이라 기본적으로 발행하지 않는다(프레임당 JPEG 인코딩
+    2회 절약). 필요하면 publish_debug_streams:=true 로 켠다.
+    """
+
     def __init__(self):
         super().__init__('opencv_node')
 
         self.declare_parameter('subscribe_topic', '/camera/image/compressed')
+        self.declare_parameter('vehicle_config_file', get_default_vehicle_config_path())
         self.declare_parameter('jpeg_quality', 90)
         self.declare_parameter('debug_log', True)
+        # gray/blur 발행 여부(디버그용). 기본 off 로 CPU 절약.
+        self.declare_parameter('publish_debug_streams', False)
+
+        # 차선 추출 방식: 'color'(흰/노랑 HSV 색 임계값, 기본) 또는 'edge'(Canny).
+        # 2026-07-05 트랙 테스트에서 color 가 차선을 더 안정적으로 잡아 기본값으로 채택.
+        # 실시간 토글: ros2 param set /opencv_node detect_mode edge
+        self.declare_parameter('detect_mode', 'color')
+        # 흰색(HSV): 채도 낮고 명도 높음. 조명 밝으면 white_v_min 을 낮춘다.
+        # 2026-07-05 튜닝: 200/40 은 너무 엄격해 흰 차선이 깜빡여서 180/55 로 완화.
+        self.declare_parameter('white_s_max', 55)
+        self.declare_parameter('white_v_min', 180)
+        # 노란색(HSV): H 18~38 부근. OpenCV 는 H 가 0~179 임에 주의.
+        self.declare_parameter('yellow_h_min', 18)
+        self.declare_parameter('yellow_h_max', 38)
+        self.declare_parameter('yellow_s_min', 80)
+        self.declare_parameter('yellow_v_min', 80)
 
         subscribe_topic = str(self.get_parameter('subscribe_topic').value)
+        self.vehicle_config_file = os.path.expanduser(
+            str(self.get_parameter('vehicle_config_file').value)
+        )
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.debug_log = bool(self.get_parameter('debug_log').value)
+        self.publish_debug_streams = bool(self.get_parameter('publish_debug_streams').value)
 
         if not 0 <= self.jpeg_quality <= 100:
             raise ValueError('jpeg_quality must be in range [0, 100]')
+
+        # 차선 처리 해상도. config 값을 기본으로 하되 param 으로도 노출/오버라이드.
+        proc_w, proc_h = self.load_lane_proc_size()
+        self.declare_parameter('lane_proc_width', proc_w)
+        self.declare_parameter('lane_proc_height', proc_h)
+        self.lane_proc_width = int(self.get_parameter('lane_proc_width').value)
+        self.lane_proc_height = int(self.get_parameter('lane_proc_height').value)
 
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -35,25 +85,76 @@ class OpenCvNode(Node):
             image_qos,
         )
 
-        self.gray_pub = self.create_publisher(
-            CompressedImage,
-            '/opencv/image/grayscale',
-            image_qos,
-        )
-        self.blur_pub = self.create_publisher(
-            CompressedImage,
-            '/opencv/image/blur',
-            image_qos,
-        )
+        # 차선검출이 실제로 쓰는 건 edge 뿐. 항상 발행.
         self.edge_pub = self.create_publisher(
             CompressedImage,
             '/opencv/image/edge',
             image_qos,
         )
+        # gray/blur 는 디버그용 -> 켜졌을 때만 퍼블리셔 생성.
+        self.gray_pub = None
+        self.blur_pub = None
+        if self.publish_debug_streams:
+            self.gray_pub = self.create_publisher(
+                CompressedImage, '/opencv/image/grayscale', image_qos,
+            )
+            self.blur_pub = self.create_publisher(
+                CompressedImage, '/opencv/image/blur', image_qos,
+            )
 
         self.get_logger().info(
-            f'OpenCV node started: subscribe_topic={subscribe_topic}, jpeg_quality={self.jpeg_quality}'
+            'OpenCV node started:\n'
+            f'  subscribe_topic={subscribe_topic}\n'
+            f'  detect_mode={str(self.get_parameter("detect_mode").value)}\n'
+            f'  lane_proc={self.lane_proc_width}x{self.lane_proc_height}\n'
+            f'  publish_debug_streams={self.publish_debug_streams}\n'
+            f'  jpeg_quality={self.jpeg_quality}'
         )
+
+    def load_lane_proc_size(self):
+        default_size = (320, 160)
+        if not os.path.exists(self.vehicle_config_file):
+            return default_size
+        try:
+            with open(self.vehicle_config_file, 'r', encoding='utf-8') as stream:
+                config_data = yaml.safe_load(stream) or {}
+        except Exception as exc:
+            self.get_logger().warning(f'Failed to read vehicle config: {exc}')
+            return default_size
+        width = int(config_data.get('LANE_PROC_WIDTH', default_size[0]))
+        height = int(config_data.get('LANE_PROC_HEIGHT', default_size[1]))
+        return width, height
+
+    def color_lane_mask(self, bgr):
+        """흰색+노란색 차선만 남기는 이진 마스크(HSV 색 임계값).
+
+        Canny 는 모든 경계(그림자·트랙끝·다른 차)를 다 잡아 노이즈가 많지만,
+        색 임계값은 차선 색만 골라내 더 안정적일 수 있다(대신 조명 변화에 민감).
+        임계값은 파라미터로 노출 -> venue 조명에서 라이브 튜닝 가능.
+        """
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        gp = self.get_parameter
+
+        # 흰색: H 전체, S 낮음, V 높음
+        white = cv2.inRange(
+            hsv,
+            np.array([0, 0, int(gp('white_v_min').value)], dtype=np.uint8),
+            np.array([179, int(gp('white_s_max').value), 255], dtype=np.uint8),
+        )
+        # 노란색: H 특정 대역, S/V 충분
+        yellow = cv2.inRange(
+            hsv,
+            np.array([
+                int(gp('yellow_h_min').value),
+                int(gp('yellow_s_min').value),
+                int(gp('yellow_v_min').value),
+            ], dtype=np.uint8),
+            np.array([int(gp('yellow_h_max').value), 255, 255], dtype=np.uint8),
+        )
+        mask = cv2.bitwise_or(white, yellow)
+        # 점잡음 제거
+        mask = cv2.medianBlur(mask, 5)
+        return mask
 
     def to_compressed_msg(self, image, source_msg: CompressedImage, frame_id: str):
         ok, encoded = cv2.imencode(
@@ -72,7 +173,6 @@ class OpenCvNode(Node):
         out_msg.data = encoded.tobytes()
         return out_msg
 
-
     def image_callback(self, msg: CompressedImage):
         raw_data = np.frombuffer(msg.data, dtype=np.uint8)
         np_arr = cv2.imdecode(raw_data, cv2.IMREAD_COLOR)
@@ -81,24 +181,46 @@ class OpenCvNode(Node):
             self.get_logger().warning('Failed to decode compressed image')
             return
 
+        # 차선 처리 해상도로 다운스케일(카메라가 640x480 이어도 여기서 320x160 으로).
+        # 이후 Canny/인코딩이 전부 저해상도에서 돌아 차선 튜닝값(ROI/px)이 그대로 유효.
+        if self.lane_proc_width > 0 and self.lane_proc_height > 0 and (
+            np_arr.shape[1] != self.lane_proc_width
+            or np_arr.shape[0] != self.lane_proc_height
+        ):
+            np_arr = cv2.resize(
+                np_arr,
+                (self.lane_proc_width, self.lane_proc_height),
+                interpolation=cv2.INTER_AREA,
+            )
+
         gray = cv2.cvtColor(np_arr, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edge = cv2.Canny(blur, 50, 150)
 
-        gray_msg = self.to_compressed_msg(gray, msg, frame_id='opencv_grayscale')
-        blur_msg = self.to_compressed_msg(blur, msg, frame_id='opencv_blur')
+        # 차선 이진영상 생성: color 모드면 흰/노랑 색마스크, 아니면 Canny 엣지.
+        # 어느 쪽이든 lane_detection 은 동일하게 /opencv/image/edge 를 구독해 처리한다.
+        mode = str(self.get_parameter('detect_mode').value)
+        if mode == 'color':
+            edge = self.color_lane_mask(np_arr)
+        else:
+            edge = cv2.Canny(blur, 50, 150)
+
         edge_msg = self.to_compressed_msg(edge, msg, frame_id='opencv_edge')
-        if gray_msg is None or blur_msg is None or edge_msg is None:
+        if edge_msg is None:
             return
-
-        self.gray_pub.publish(gray_msg)
-        self.blur_pub.publish(blur_msg)
         self.edge_pub.publish(edge_msg)
 
-        if self.debug_log:
-            self.get_logger().info('Published grayscale/blur/edge frames')
+        # gray/blur 는 디버그용 -> 켜졌을 때만 인코딩/발행(평소 CPU 절약).
+        if self.publish_debug_streams:
+            gray_msg = self.to_compressed_msg(gray, msg, frame_id='opencv_grayscale')
+            blur_msg = self.to_compressed_msg(blur, msg, frame_id='opencv_blur')
+            if gray_msg is not None:
+                self.gray_pub.publish(gray_msg)
+            if blur_msg is not None:
+                self.blur_pub.publish(blur_msg)
 
-    
+        if self.debug_log:
+            self.get_logger().info('Published edge frame')
+
 
 def main(args=None):
     rclpy.init(args=args)

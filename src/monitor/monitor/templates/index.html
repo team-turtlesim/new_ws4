@@ -60,18 +60,8 @@
           </dl>
 
           {% if debug_image %}
-          <div class="debug-grid" id="debug-grid">
-            <article class="debug-panel">
-              <p class="debug-panel__title">Grayscale</p>
-              <img id="debug-frame-grayscale" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Grayscale preview">
-              <p class="debug-panel__topic">{{ opencv_grayscale_topic }}</p>
-            </article>
-            <article class="debug-panel">
-              <p class="debug-panel__title">Blur</p>
-              <img id="debug-frame-blur" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Blur preview">
-              <p class="debug-panel__topic">{{ opencv_blur_topic }}</p>
-            </article>
-            <article class="debug-panel">
+          <div class="debug-grid debug-grid--single" id="debug-grid">
+            <article class="debug-panel debug-panel--edge">
               <p class="debug-panel__title">Edge</p>
               <img id="debug-frame-edge" class="debug-panel__frame" src="{{ placeholder_url }}" alt="Edge preview">
               <p class="debug-panel__topic">{{ opencv_edge_topic }}</p>

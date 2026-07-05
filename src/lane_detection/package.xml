@@ -1,16 +1,17 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>opencv</name>
+  <name>lane_detection</name>
   <version>0.0.0</version>
-  <description>OpenCV image processing package for compressed topics.</description>
+  <description>Lane detection node: consumes opencv edge image, estimates lane-center offset, publishes LaneInfo.</description>
   <maintainer email="sooyong.park@telechips.com">topst</maintainer>
   <license>TODO: License declaration</license>
 
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>interface</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>python3-opencv</exec_depend>
-  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>opencv-python</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -258,6 +258,17 @@ code {
   margin-top: 14px;
 }
 
+/* Edge 만 남겼을 때: 단일 열로 카드 전체 폭을 써서 크게 표시 */
+.debug-grid--single {
+  grid-template-columns: 1fr;
+}
+
+.debug-panel--edge .debug-panel__frame {
+  max-height: 60vh;
+  object-fit: contain;
+  margin: 0 auto;
+}
+
 .debug-panel {
   padding: 10px;
   border: 1px solid rgba(255, 255, 255, 0.1);

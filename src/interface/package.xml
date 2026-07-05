@@ -3,7 +3,7 @@
 <package format="3">
   <name>interface</name>
   <version>0.0.0</version>
-  <description>Shared message definitions for the D-Racer stack (Battery, Control).</description>
+  <description>Shared message definitions for the D-Racer stack (Battery, Control, LaneInfo).</description>
   <maintainer email="sooyong.park@telechips.com">topst</maintainer>
   <license>TODO: License declaration</license>
 
