@@ -43,36 +43,25 @@ def get_vehicle_config_path():
 
 
 # Tuned judgment + lateral-control params (interpret 노드가 소비).
-# 이력: 2026-07-04 live-drive 게인 -> 07-05 heading 포화/편향 정리(heading 은
-# 양쪽차선일 때만 신뢰, k_heading 0) -> 07-06 이벤트구동 전환 후 남은 직진
-# 뱀주행(리밋사이클 ~0.5Hz)을 실측 튜닝으로 확정.
-# 07-06 측정: 적분(ki)이 저속 위치루프 위상지연을 키워 리밋사이클을 유발
+# 이력: 2026-07-04 live-drive 게인 -> 07-05 heading 편향 정리 -> 07-06 이벤트구동
+# 전환 후 직진 뱀주행(리밋사이클 ~0.5Hz) 실측 튜닝, 그리고 heading 신뢰불가
+# 판명으로 offset 전용 전환.
+# 07-06 측정: 적분(ki)이 저속 위치루프 위상지연을 키워 리밋사이클 유발
 # (ki=0.2/0.05 offset std~0.11, ki=0 은 0.06). kp 과다는 2차 요인.
 #   원본(kp0.45/kd0.12/ki0.2) std 0.110 -> 최종(kp0.25/kd0.16/ki0) std 0.060(-45%).
-# 곡선은 curve_bias 로 안쪽 조준; 크로싱 심하면 0.4, 뱀주행 재발하면 0.2 로.
+# 곡선: |offset| 스케줄로 kp 부스트 + 곡선감속(반응형). heading 은 미사용(제거됨).
 INTERPRET_PARAMS = {
     'debug_log': True,
     'kp_offset': 0.25,       # 직진 kp: 0.45 -> 0.25 루프게인 축소(리밋사이클 억제)
     'kd_offset': 0.16,       # 0.12 -> 0.16 감쇠 강화(offset 깨끗해 여유 있음)
     'ki_offset': 0.0,        # 0.2 -> 0.0 적분 위상지연이 뱀주행 유발 -> 비활성
-    'k_heading': 0.0,        # 직진 heading 항 0(뱀주행 방지)
     'steer_smooth_alpha': 0.30,  # 0.35 -> 0.30 출력 평활 강화
     'd_offset_limit': 2.0,
-    'curve_bias': 0.0,        # heading 미신뢰 -> 곡선 안쪽조준 비활성(순수 offset=0 추종)
-    # 게인 스케줄링(직진<->곡선 연속 블렌딩, |heading| 기준). 07-06 곡선측정에서
-    # 직진튜닝으로는 코너에서 바깥 밀림+차선이탈 확인 -> 곡선에서만 kp↑+선행조향.
-    'kp_offset_curve': 0.45,  # 곡선 kp(시작값, 곡선주행으로 재튜닝)
-    'k_heading_curve': 0.0,   # heading 미신뢰 -> 선행조향 비활성
-    'heading_ema_alpha': 0.15,  # heading 지속성↑(단일차선 순간 토글 억제)
-    'sched_heading_lo': 0.15,
-    'sched_heading_hi': 0.35,
-    # offset 기반 복구게인(안전망): 단일차선 곡선은 heading=0 이라 heading 스케줄이
-    # 안 걸림 -> offset 이 크게 벌어지면 kp 를 올려 이탈 복구. 07-06 단일차선 곡선
-    # 이탈(off -0.9, w=0, kp0.25) 대응.
+    # 게인 스케줄링(직진<->곡선, |offset| 기준). 곡선에서 offset 이 벌어지면 kp↑.
+    'kp_offset_curve': 0.45,  # 곡선 kp(offset 교정 강화)
     'sched_offset_lo': 0.3,
     'sched_offset_hi': 0.6,
     # 곡선 감속("코너 브레이크"): w↑ 에서 throttle 을 이 비율로 낮춰 라인 유지.
-    # 07-06: kp0.45/steer0.66 로도 0.18 속도로는 급곡선 못 버팀 -> 감속 필요.
     'curve_throttle_scale': 0.9,  # 곡선 감속 비율(cruise 0.19 x 0.9 = 0.17)
     'cruise_throttle': 0.0,  # SAFE: no motion until raised via param
 }

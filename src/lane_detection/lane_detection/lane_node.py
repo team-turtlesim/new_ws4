@@ -10,11 +10,10 @@ opencv_node 가 발행하는 엣지 영상(/opencv/image/edge)을 구독하여, 
 
 파이프라인:
     엣지 영상 -> ROI 자르기 -> 행별 차선 픽셀 검출 -> 다항식 피팅/이상치 제거
-    -> 단일선 병합 -> 차선폭 학습 -> raw offset/heading/center/confidence 계산
+    -> 단일선 병합 -> 차선폭 학습 -> raw offset/center/confidence 계산
     -> LaneDetection 발행 (+ 선택적 디버그 시각화 영상 발행)
 """
 
-import math
 import os
 from pathlib import Path
 
@@ -54,12 +53,6 @@ class LaneDetectionNode(Node):
         # 과도하게 커져(=반대편으로 overshoot) 반대 차선을 넘는 것을 좌우 대칭으로 방지.
         self.declare_parameter('lane_width_min_ratio', 0.42)
         self.declare_parameter('lane_width_max_ratio', 0.62)
-        # 단일차선 heading 은 원근으로 기울어 보여 포화(garbage)됨. True 면 양쪽 차선이
-        # 모두 있을 때만 heading 을 신뢰하고, 단일차선이면 0 을 낸다(곡선예측 오작동 방지).
-        self.declare_parameter('heading_require_both_lanes', True)
-        # heading 은 두 차선의 겹치는 검출구간에서만 계산(외삽 금지). 겹침이 ROI
-        # 높이의 이 비율 미만이면 신뢰불가로 0 처리. 2026-07-06 외삽 heading 폭주 수정.
-        self.declare_parameter('heading_min_span_ratio', 0.4)
         self.declare_parameter('jpeg_quality', 90)
         self.declare_parameter('debug_image', True)
         self.declare_parameter('debug_log', False)  # lane_width/검출상태 진단 로그
@@ -163,7 +156,7 @@ class LaneDetectionNode(Node):
     # --------------------------------------------------------------- detection
     def detect_lane(self, edge):
         """ROI 안에서 행별로 좌/우 차선 x좌표를 찾아 '그 순간'의 차선 중심과
-        offset/heading/confidence 를 계산한다. 시간 평활은 하지 않는다."""
+        offset/confidence 를 계산한다. 시간 평활은 하지 않는다."""
         height, width = edge.shape
         center_x = width / 2.0
         roi_top = min(max(int(self.get_parameter('roi_top').value), 0), height - 1)
@@ -257,26 +250,8 @@ class LaneDetectionNode(Node):
             raw_offset = 0.0
             confidence = 0.0  # 완전 미검출: 신뢰도 0
 
-        # raw heading: 그 순간의 진행방향 기울기(rad). 데드밴드/클램프/EMA 없음.
-        raw_heading = self.estimate_raw_heading(
-            left_poly, right_poly, left_pts, right_pts, roi_top, height)
-
-        # --- 진단: heading 겹침구간/비대칭 계측(외삽 수정 검증용) ---
-        if bool(self.get_parameter('debug_log').value) and left_pts and right_pts:
-            ly = [y for y, _ in left_pts]
-            ry = [y for y, _ in right_pts]
-            ov = min(max(ly), max(ry)) - max(min(ly), min(ry))  # 겹침 y 폭
-            self.get_logger().info(
-                f'HEAD hd={raw_heading:+.3f} | '
-                f'Lpts={len(left_pts)} y[{min(ly)}~{max(ly)}] '
-                f'Rpts={len(right_pts)} y[{min(ry)}~{max(ry)}] '
-                f'overlap={ov}px (min={self.get_parameter("heading_min_span_ratio").value}xROI)',
-                throttle_duration_sec=0.15,
-            )
-
         return {
             'raw_offset': raw_offset,
-            'raw_heading': raw_heading,
             'left_detected': left_detected,
             'right_detected': right_detected,
             'confidence': float(np.clip(confidence, 0.0, 1.0)),
@@ -430,42 +405,6 @@ class LaneDetectionNode(Node):
         filtered = [(int(y), int(x)) for y, x in zip(ys2, xs2)]
         return filtered, poly
 
-    def estimate_raw_heading(self, left_poly, right_poly, left_pts, right_pts, roi_top, height):
-        """두 차선의 '실제 검출점이 겹치는 y 구간'에서만 차선중심 기울기를 재
-        진행방향(rad)을 추정한다. 데드밴드/클램프/EMA 는 하지 않는다(interpret 담당).
-
-        2026-07-06 근본수정: 예전엔 각 차선 직선피팅을 ROI 전체(roi_top~height-1)로
-        '외삽'해 끝점 중심을 이었다. 그런데 좌/우가 서로 다른 y범위로 검출되면(점선
-        중앙선·주행 흔들림) 짧게 검출된 차선을 데이터 밖으로 외삽 -> 화면 밖(x=-51)
-        같은 값이 나와 중심선이 기울고 heading 이 폭주(주행 중 ±0.5, 심하면 -1.3).
-        그래서 '두 차선 모두 실제 점이 있는 겹치는 구간'에서만 계산하고, 겹침이
-        짧으면(신뢰불가) 0 을 낸다. 외삽 완전 제거."""
-        # 양쪽 차선이 모두 있어야 heading 을 신뢰(단일차선은 원근으로 가짜 slope).
-        if left_poly is None or right_poly is None:
-            return 0.0
-        if not left_pts or not right_pts:
-            return 0.0
-
-        ly = [y for y, _ in left_pts]
-        ry = [y for y, _ in right_pts]
-        # 겹치는 검출 구간: 두 차선 모두 점을 가진 y 범위(외삽 금지).
-        y_lo = float(max(min(ly), min(ry)))   # 위쪽 경계(작은 y)
-        y_hi = float(min(max(ly), max(ry)))   # 아래쪽 경계(큰 y)
-
-        # 겹침이 ROI 높이의 이 비율 미만이면 기울기 추정을 신뢰하지 않음 -> 0.
-        roi_h = float(max(1, height - 1 - roi_top))
-        min_span = float(self.get_parameter('heading_min_span_ratio').value) * roi_h
-        if (y_hi - y_lo) < max(min_span, 1.0):
-            return 0.0
-
-        # 겹치는 구간 안에서만 피팅선을 평가(외삽 아님) -> 중심선 기울기.
-        c_top = 0.5 * (float(left_poly(y_lo)) + float(right_poly(y_lo)))
-        c_bottom = 0.5 * (float(left_poly(y_hi)) + float(right_poly(y_hi)))
-
-        # x = f(y), y는 아래로 갈수록 증가. 전진 = 위쪽(y 감소).
-        slope = (c_bottom - c_top) / (y_hi - y_lo)  # d(center_x)/d(y)
-        return math.atan2(-slope, 1.0)  # 전진 기준 우측 휨을 양수로
-
     # ------------------------------------------------------------------ callbk
     def image_callback(self, msg: CompressedImage):
         edge = self.decode_edge(msg)
@@ -494,7 +433,6 @@ class LaneDetectionNode(Node):
             float(result['lane_center']) if result['lane_center'] is not None else -1.0
         )
         detection.raw_offset = result['raw_offset']
-        detection.raw_heading = result['raw_heading']
         detection.left_detected = result['left_detected']
         detection.right_detected = result['right_detected']
         detection.confidence = result['confidence']

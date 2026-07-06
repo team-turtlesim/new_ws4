@@ -13,10 +13,6 @@ float32 lane_center_px   # 검출된 차선 중심 x (px); 완전 미검출 시 
 # 양수(+) = 차선 중심이 오른쪽 → 차량이 왼쪽으로 치우침. EMA 등 시간필터 없음.
 float32 raw_offset
 
-# 진행방향 기울기 (rad). 차선 기울기 기반. 양수 = 진행할수록 차선이 오른쪽으로 휨.
-# 데드밴드/클램프/EMA 없는 원시값 (판단은 interpret 이 담당).
-float32 raw_heading
-
 bool  left_detected      # 좌측 차선 검출 여부
 bool  right_detected     # 우측 차선 검출 여부
 float32 confidence       # 인식 신뢰도 0.0~1.0 (검출 줄 수 / 전체 스캔 줄 수)
