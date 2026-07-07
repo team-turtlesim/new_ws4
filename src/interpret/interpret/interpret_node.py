@@ -67,6 +67,203 @@ def lerp(a, b, t):
     return a + (b - a) * t
 
 
+class Judgment:
+    """판단(Decision): 인지(차선/YOLO/ArUco)를 시간필터·신뢰·중재해 '목표'를 만든다.
+    상태(필터값·인지 플래그)를 소유하고 파라미터/시계는 노드에서 읽는다. 제어(PID)는
+    전혀 모른다 — offset 안정화 + 정지/감속 판정만 한다. (동작은 기존과 동일; 코드 조직만)"""
+
+    def __init__(self, node):
+        self.node = node
+        self.ema_alpha = node.ema_alpha            # 노드가 읽고 검증한 값 그대로
+        self.offset_filtered = 0.0                 # 미검출 시 마지막 값 유지
+        # YOLO/ArUco 연동 상태(라벨/임계값 등은 콜백에서 매번 param 재읽기 → 라이브 튜닝)
+        self.yolo_enabled = bool(node.get_parameter('yolo_enabled').value)
+        self.yolo_stop = False
+        self.yolo_slow = False
+        self.last_yolo_time = None
+        self.aruco_enabled = bool(node.get_parameter('aruco_enabled').value)
+        self.aruco_stop = False
+        self.last_aruco_time = None
+
+    # --- 시간필터 ---
+    def filter_offset(self, raw_offset, detected, single_line):
+        """검출 시 EMA 저역통과, 미검출 시 마지막 필터값 유지.
+        단독선일 때는 offset 을 축소·클램프해 신뢰도를 낮춘다(과대/요동 억제)."""
+        gp = self.node.get_parameter
+        if single_line:
+            scale = float(gp('single_line_offset_scale').value)
+            limit = float(gp('single_line_offset_limit').value)
+            raw_offset = max(-limit, min(limit, raw_offset * scale))
+        if detected:
+            self.offset_filtered = (
+                self.ema_alpha * raw_offset
+                + (1.0 - self.ema_alpha) * self.offset_filtered
+            )
+        # 미검출: self.offset_filtered 를 직전 값 그대로 유지
+        return float(max(-1.0, min(1.0, self.offset_filtered)))
+
+    # --- 인지 플래그 갱신(구독 콜백에서 호출) ---
+    def on_yolo(self, msg):
+        """YOLO 검출을 받아 정지/감속 플래그를 갱신. 임계값·라벨은 매번 param 재읽기."""
+        self.last_yolo_time = self.node.get_clock().now()
+        gp = self.node.get_parameter
+        self.yolo_enabled = bool(gp('yolo_enabled').value)
+        if not self.yolo_enabled:
+            self.yolo_stop = False
+            self.yolo_slow = False
+            return
+        min_conf = float(gp('yolo_min_confidence').value)
+        min_area = float(gp('yolo_min_box_area_ratio').value)
+        stop_labels = set(gp('yolo_stop_labels').value)
+        slow_labels = set(gp('yolo_slow_labels').value)
+        img_area = float(max(1, int(msg.image_width) * int(msg.image_height)))
+        stop = False
+        slow = False
+        for d in msg.detections:
+            if float(d.confidence) < min_conf:
+                continue
+            # 박스 면적비 = 근접 프록시. 작은(먼) 검출은 무시해 조기·오반응 방지.
+            if (float(d.width) * float(d.height)) / img_area < min_area:
+                continue
+            if d.label in stop_labels:
+                stop = True
+            elif d.label in slow_labels:
+                slow = True
+        self.yolo_stop = stop
+        self.yolo_slow = slow
+
+    def on_aruco(self, msg):
+        """aruco_node 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신."""
+        self.last_aruco_time = self.node.get_clock().now()
+        self.aruco_enabled = bool(self.node.get_parameter('aruco_enabled').value)
+        self.aruco_stop = bool(msg.data) if self.aruco_enabled else False
+
+    # --- 인지 중재: 정지/감속 판정 ---
+    def perception_stop_slow(self):
+        """YOLO/ArUco 인지를 종합해 (stop, slow) 판정. 각 소스는 stale(노드 사망 등)이면
+        무시한다(죽은 인지가 브레이크를 영구히 잡지 않게)."""
+        now = self.node.get_clock().now()
+        gp = self.node.get_parameter
+        stop = False
+        slow = False
+        if self.yolo_enabled and self.last_yolo_time is not None:
+            age = (now - self.last_yolo_time).nanoseconds * 1e-9
+            if age <= float(gp('yolo_stop_timeout_sec').value):
+                if self.yolo_stop:
+                    stop = True
+                elif self.yolo_slow:
+                    slow = True
+        if self.aruco_enabled and self.last_aruco_time is not None:
+            age = (now - self.last_aruco_time).nanoseconds * 1e-9
+            if age <= float(gp('aruco_stop_timeout_sec').value):
+                if self.aruco_stop:
+                    stop = True
+        return stop, slow
+
+    def debug_tag(self):
+        """디버그 로그 접미사(원본과 동일 포맷)."""
+        tag = ''
+        if self.yolo_enabled:
+            tag += ' yolo=' + ('STOP' if self.yolo_stop else 'slow' if self.yolo_slow else '-')
+        if self.aruco_enabled and self.aruco_stop:
+            tag += ' aruco=STOP'
+        return tag
+
+
+class Controller:
+    """제어(Control law): 판단이 준 목표(offset + 정지/감속)를 PID 로 추종해 조향/스로틀
+    명령을 계산한다. '무엇을/왜' 는 모른다 — 목표 추종만. 상태(적분·이전값·명령) 소유.
+    (run_control 로직을 그대로 옮긴 것; 동작 동일. 발행/로그는 노드가 한다.)"""
+
+    def __init__(self, node, steer_trim):
+        self.node = node
+        self.steer_trim = steer_trim
+        self.prev_offset_for_d = 0.0
+        self.prev_time = None                      # 미분/슬루 dt 계산용 (콜백 간 시간)
+        self.throttle_cmd = 0.0
+        self.steer_cmd_filtered = steer_trim       # EMA-smoothed 조향 출력
+        self.was_low_conf = False                  # 직전 프레임 신뢰도 미달?
+        self.integral = 0.0                        # offset 오차 적분(I 항)
+
+    def step(self, offset, confidence, stop, slow):
+        """offset PID + 스로틀 목표(정지/감속 반영) + 슬루 -> (steering, throttle, diag)."""
+        gp = self.node.get_parameter
+        now = self.node.get_clock().now()
+        if self.prev_time is None:
+            dt = 1.0 / 30.0   # 첫 프레임 가정치(카메라 ~30fps)
+        else:
+            dt = (now - self.prev_time).nanoseconds * 1e-9
+            if dt <= 0.0 or dt > 1.0:
+                dt = 1.0 / 30.0
+        self.prev_time = now
+
+        kp_straight = float(gp('kp_offset').value)
+        kd = float(gp('kd_offset').value)
+        ki = float(gp('ki_offset').value)
+        i_limit = float(gp('i_limit').value)
+        kp_curve = float(gp('kp_offset_curve').value)
+        sched_off_lo = float(gp('sched_offset_lo').value)
+        sched_off_hi = float(gp('sched_offset_hi').value)
+        steer_limit = float(gp('steer_limit').value)
+        steer_sign = float(gp('steer_sign').value)
+        d_limit = float(gp('d_offset_limit').value)
+        alpha = clip(float(gp('steer_smooth_alpha').value), 0.05, 1.0)
+        min_conf = float(gp('min_confidence').value)
+
+        low_conf = confidence < min_conf
+
+        # 게인 스케줄링: |offset| 로 직진<->곡선 블렌딩(반응형).
+        w = smoothstep(abs(offset), sched_off_lo, sched_off_hi)
+        kp = lerp(kp_straight, kp_curve, w)
+
+        error = offset  # 목표 = 차선중앙(offset=0)
+
+        # 미분(클램프); 검출 복귀 프레임엔 리셋해 슬램 방지.
+        if self.was_low_conf and not low_conf:
+            self.prev_offset_for_d = offset
+        d_offset = clip((offset - self.prev_offset_for_d) / dt, -d_limit, d_limit)
+        self.prev_offset_for_d = offset
+        self.was_low_conf = low_conf
+
+        # 적분(anti-windup): 추종 중 & 전진 중일 때만 누적; 아니면 리셋.
+        if low_conf or self.throttle_cmd <= 0.0:
+            self.integral = 0.0
+        elif ki > 0.0:
+            self.integral += error * dt
+            self.integral = clip(self.integral, -i_limit / ki, i_limit / ki)
+        i_term = clip(ki * self.integral, -i_limit, i_limit)
+
+        # PID 후 EMA 저역통과로 부드러운 출력.
+        logical = kp * error + i_term + kd * d_offset
+        logical = clip(logical, -steer_limit, steer_limit)
+        steering_raw = clip(self.steer_trim + steer_sign * logical, -1.0, 1.0)
+        self.steer_cmd_filtered = (
+            alpha * steering_raw + (1.0 - alpha) * self.steer_cmd_filtered
+        )
+        steering = clip(self.steer_cmd_filtered, -1.0, 1.0)
+
+        # 스로틀: lane lost 아니면 cruise; 곡선(w↑) 감속; 인지 정지/감속; 슬루 제한.
+        cruise = float(gp('cruise_throttle').value)
+        max_throttle = float(gp('max_throttle').value)
+        slew = float(gp('throttle_slew_per_sec').value)
+        curve_thr_scale = float(gp('curve_throttle_scale').value)
+        throttle_scale = lerp(1.0, curve_thr_scale, w)
+        target_throttle = 0.0 if low_conf else clip(cruise * throttle_scale, 0.0, max_throttle)
+        # 판단이 준 정지/감속 반영 (원래 apply_perception_gate 의 적용부와 동일).
+        if stop:
+            target_throttle = 0.0
+        elif slow:
+            target_throttle = target_throttle * float(gp('yolo_slow_scale').value)
+
+        step = slew * dt
+        if target_throttle > self.throttle_cmd:
+            self.throttle_cmd = min(self.throttle_cmd + step, target_throttle)
+        else:
+            self.throttle_cmd = max(self.throttle_cmd - step, target_throttle)
+
+        return steering, self.throttle_cmd, {'i': i_term, 'd': d_offset, 'w': w, 'kp': kp}
+
+
 class InterpretNode(Node):
     def __init__(self):
         super().__init__('interpret_node')
@@ -180,27 +377,12 @@ class InterpretNode(Node):
         )
         self.steer_trim = self.load_steer_trim()
 
-        # --- 내부 상태: 판단(시간필터) ------------------------------------
-        self.offset_filtered = 0.0     # 필터링된 lane_offset (미검출 시 마지막 값 유지)
-
-        # --- 내부 상태: 제어(PID/평활/슬루) -------------------------------
-        self.prev_offset_for_d = 0.0
-        self.prev_time = None           # 미분/슬루 dt 계산용 (콜백 간 시간)
-        self.throttle_cmd = 0.0
-        self.steer_cmd_filtered = self.steer_trim  # EMA-smoothed 조향 출력
-        self.was_low_conf = False       # 직전 프레임 신뢰도 미달?
-        self.integral = 0.0             # offset 오차 적분(I 항)
-
-        # --- YOLO 연동 상태(라벨/임계값 등은 콜백에서 매번 param 재읽기 → 라이브 튜닝) ---
-        self.yolo_enabled = bool(self.get_parameter('yolo_enabled').value)
-        self.yolo_stop = False          # 최근 프레임에 정지대상 검출?
-        self.yolo_slow = False          # 최근 프레임에 감속대상 검출?
-        self.last_yolo_time = None      # 마지막 /yolo/detections 수신 시각(stale 판정)
-
-        # --- ArUco 연동 상태 ---
-        self.aruco_enabled = bool(self.get_parameter('aruco_enabled').value)
-        self.aruco_stop = False         # 최근 /aruco_stop 값 (True=정지)
-        self.last_aruco_time = None     # 마지막 /aruco_stop 수신 시각(stale 판정)
+        # --- 판단/제어 분리 (동작 동일; 코드 조직만) ---
+        # 판단(Judgment): 시간필터 + 인지 정지/감속 판정.  상태(필터값·인지 플래그) 소유.
+        # 제어(Controller): 그 목표를 PID 로 추종.        상태(적분·이전값·명령) 소유.
+        # 둘 다 파라미터/시계는 이 노드에서 읽는다. 한 콜백에서 이어 실행(이벤트구동 유지).
+        self.judgment = Judgment(self)
+        self.controller = Controller(self, self.steer_trim)
 
         self.subscription = self.create_subscription(
             LaneDetection,
@@ -245,15 +427,17 @@ class InterpretNode(Node):
 
     # ------------------------------------------------------------------ callbk
     def detection_callback(self, msg: LaneDetection):
-        """프레임 도착 즉시: 판단(offset 시간필터) -> LaneInfo 발행 -> PID -> Control."""
+        """프레임 도착 즉시: 판단(시간필터+정지/감속 판정) -> LaneInfo 발행 -> 제어(PID)
+        -> Control 발행. 이벤트구동(한 콜백에서 판단→제어 이어 실행)."""
         detected = bool(msg.left_detected or msg.right_detected)
         # 단독선 = 좌/우 중 정확히 한쪽만 검출 (XOR)
         single_line = bool(msg.left_detected) != bool(msg.right_detected)
 
-        offset = self.filter_offset(float(msg.raw_offset), detected, single_line)
+        # --- 판단: offset 시간필터 ---
+        offset = self.judgment.filter_offset(float(msg.raw_offset), detected, single_line)
         confidence = float(msg.confidence)
 
-        # 1) 판단 결과를 LaneInfo 로도 발행(디버그/rosbag; 런타임 구독자는 없음).
+        # 판단 결과를 LaneInfo 로도 발행(디버그/rosbag; 런타임 구독자는 없음).
         lane_info = LaneInfo()
         lane_info.header.stamp = msg.header.stamp
         lane_info.header.frame_id = 'interpret'
@@ -263,118 +447,16 @@ class InterpretNode(Node):
         lane_info.confidence = confidence
         self.lane_pub.publish(lane_info)
 
-        # 2) 제어결정(PID) -> Control 발행.
-        self.run_control(offset, confidence)
-
-    # ------------------------------------------------------------------ filters
-    def filter_offset(self, raw_offset, detected, single_line):
-        """검출 시 EMA 저역통과, 미검출 시 마지막 필터값 유지.
-        단독선일 때는 offset 을 축소·클램프해 신뢰도를 낮춘다(과대/요동 억제)."""
-        if single_line:
-            scale = float(self.get_parameter('single_line_offset_scale').value)
-            limit = float(self.get_parameter('single_line_offset_limit').value)
-            raw_offset = max(-limit, min(limit, raw_offset * scale))
-        if detected:
-            self.offset_filtered = (
-                self.ema_alpha * raw_offset
-                + (1.0 - self.ema_alpha) * self.offset_filtered
-            )
-        # 미검출: self.offset_filtered 를 직전 값 그대로 유지
-        return float(max(-1.0, min(1.0, self.offset_filtered)))
-
-    # ------------------------------------------------------------------ control
-    def run_control(self, offset, confidence):
-        """판단된 offset/confidence 로 offset PID 를 돌려 조향/스로틀을 계산하고
-        Control 을 발행한다. 프레임 도착마다 호출(이벤트구동).
-        dt 는 콜백 간 실제 경과시간(프레임 간격)을 쓴다."""
-        now = self.get_clock().now()
-        if self.prev_time is None:
-            dt = 1.0 / 30.0   # 첫 프레임 가정치(카메라 ~30fps)
-        else:
-            dt = (now - self.prev_time).nanoseconds * 1e-9
-            if dt <= 0.0 or dt > 1.0:
-                dt = 1.0 / 30.0
-        self.prev_time = now
-
-        kp_straight = float(self.get_parameter('kp_offset').value)
-        kd = float(self.get_parameter('kd_offset').value)
-        ki = float(self.get_parameter('ki_offset').value)
-        i_limit = float(self.get_parameter('i_limit').value)
-        kp_curve = float(self.get_parameter('kp_offset_curve').value)
-        sched_off_lo = float(self.get_parameter('sched_offset_lo').value)
-        sched_off_hi = float(self.get_parameter('sched_offset_hi').value)
-        steer_limit = float(self.get_parameter('steer_limit').value)
-        steer_sign = float(self.get_parameter('steer_sign').value)
-        d_limit = float(self.get_parameter('d_offset_limit').value)
-        alpha = clip(float(self.get_parameter('steer_smooth_alpha').value), 0.05, 1.0)
-        min_conf = float(self.get_parameter('min_confidence').value)
-
-        low_conf = confidence < min_conf
-
-        # --- 게인 스케줄링: |offset| 로 직진<->곡선 블렌딩(반응형). ---
-        # offset 이 커지면(=곡선/이탈로 바깥 밀림) kp 부스트 + 감속으로 반응 복구.
-        # 직진(|offset|~0.1)은 lo 아래라 kp=직진값 유지(뱀주행 튜닝 보존).
-        w = smoothstep(abs(offset), sched_off_lo, sched_off_hi)
-        kp = lerp(kp_straight, kp_curve, w)
-
-        error = offset  # 목표 = 차선중앙(offset=0)
-
-        # --- 미분(클램프); 검출 복귀 프레임엔 리셋해 슬램 방지. ---
-        if self.was_low_conf and not low_conf:
-            # 방금 차선 재획득: offset 이 정지 HOLD 값에서 튀어 이 프레임의 raw
-            # 미분은 garbage -> 억제.
-            self.prev_offset_for_d = offset
-        d_offset = clip((offset - self.prev_offset_for_d) / dt, -d_limit, d_limit)
-        self.prev_offset_for_d = offset
-        self.was_low_conf = low_conf
-
-        # --- 적분(anti-windup): 추종 중 & 전진 중일 때만 누적; 아니면 리셋. ---
-        if low_conf or self.throttle_cmd <= 0.0:
-            self.integral = 0.0
-        elif ki > 0.0:
-            self.integral += error * dt
-            self.integral = clip(self.integral, -i_limit / ki, i_limit / ki)
-        i_term = clip(ki * self.integral, -i_limit, i_limit)
-
-        # --- PID 후 EMA 저역통과로 부드러운 출력. ---
-        logical = kp * error + i_term + kd * d_offset
-        logical = clip(logical, -steer_limit, steer_limit)
-        steering_raw = clip(self.steer_trim + steer_sign * logical, -1.0, 1.0)
-        self.steer_cmd_filtered = (
-            alpha * steering_raw + (1.0 - alpha) * self.steer_cmd_filtered
-        )
-        steering = clip(self.steer_cmd_filtered, -1.0, 1.0)
-
-        # --- 스로틀: lane lost 아니면 cruise; 곡선(w↑) 감속; 슬루 제한. ---
-        cruise = float(self.get_parameter('cruise_throttle').value)
-        max_throttle = float(self.get_parameter('max_throttle').value)
-        slew = float(self.get_parameter('throttle_slew_per_sec').value)
-        curve_thr_scale = float(self.get_parameter('curve_throttle_scale').value)
-
-        throttle_scale = lerp(1.0, curve_thr_scale, w)
-        target_throttle = 0.0 if low_conf else clip(cruise * throttle_scale, 0.0, max_throttle)
-
-        # 인지 게이팅(YOLO 정지/감속 + ArUco 정지): 정지신호면 목표 0. 기존 slew 가 이
-        # 목표까지 부드럽게 램프하므로 급정거가 아니라 완만 감속이 된다(조향은 그대로 유지).
-        target_throttle = self.apply_perception_gate(target_throttle)
-
-        step = slew * dt
-        if target_throttle > self.throttle_cmd:
-            self.throttle_cmd = min(self.throttle_cmd + step, target_throttle)
-        else:
-            self.throttle_cmd = max(self.throttle_cmd - step, target_throttle)
-
-        self.publish_control(steering, self.throttle_cmd)
+        # --- 판단: 인지 정지/감속 판정 -> 제어(PID)로 목표 추종 -> Control 발행 ---
+        stop, slow = self.judgment.perception_stop_slow()
+        steering, throttle, diag = self.controller.step(offset, confidence, stop, slow)
+        self.publish_control(steering, throttle)
 
         if bool(self.get_parameter('debug_log').value):
-            yolo_tag = ''
-            if self.yolo_enabled:
-                yolo_tag = ' yolo=' + ('STOP' if self.yolo_stop else 'slow' if self.yolo_slow else '-')
-            aruco_tag = ' aruco=STOP' if (self.aruco_enabled and self.aruco_stop) else ''
             self.get_logger().info(
-                f'off={offset:+.3f} i={i_term:+.3f} d={d_offset:+.3f} '
-                f'conf={confidence:.2f} w={w:.2f} kp={kp:.2f} '
-                f'-> steer={steering:+.3f} thr={self.throttle_cmd:.3f}{yolo_tag}{aruco_tag}'
+                f'off={offset:+.3f} i={diag["i"]:+.3f} d={diag["d"]:+.3f} '
+                f'conf={confidence:.2f} w={diag["w"]:.2f} kp={diag["kp"]:.2f} '
+                f'-> steer={steering:+.3f} thr={throttle:.3f}{self.judgment.debug_tag()}'
             )
 
     def publish_control(self, steering, throttle):
@@ -384,72 +466,14 @@ class InterpretNode(Node):
         msg.throttle = float(throttle)
         self.control_pub.publish(msg)
 
-    # ------------------------------------------------------------------ yolo
+    # --------------------------------------------------------- 인지 구독(판단 위임)
+    # 구독 콜백은 판단(Judgment)으로 위임한다. 실제 정지/감속 판정과 필터는 Judgment 가,
+    # PID 는 Controller 가 담당한다(위쪽 클래스). 노드는 배선/발행/로그만.
     def yolo_callback(self, msg: DetectionArray):
-        """YOLO 검출을 받아 정지/감속 플래그를 갱신. 임계값·라벨은 매번 param 을 다시
-        읽어 라이브 튜닝을 허용한다(다른 노드들과 동일 관례). yolo_enabled=False 면 즉시
-        플래그를 내려 스로틀에 영향을 주지 않는다."""
-        self.last_yolo_time = self.get_clock().now()
-        self.yolo_enabled = bool(self.get_parameter('yolo_enabled').value)
-        if not self.yolo_enabled:
-            self.yolo_stop = False
-            self.yolo_slow = False
-            return
-
-        min_conf = float(self.get_parameter('yolo_min_confidence').value)
-        min_area = float(self.get_parameter('yolo_min_box_area_ratio').value)
-        stop_labels = set(self.get_parameter('yolo_stop_labels').value)
-        slow_labels = set(self.get_parameter('yolo_slow_labels').value)
-        img_area = float(max(1, int(msg.image_width) * int(msg.image_height)))
-
-        stop = False
-        slow = False
-        for d in msg.detections:
-            if float(d.confidence) < min_conf:
-                continue
-            # 박스 면적비 = 근접 프록시. 작은(먼) 검출은 무시해 조기·오반응 방지.
-            if (float(d.width) * float(d.height)) / img_area < min_area:
-                continue
-            if d.label in stop_labels:
-                stop = True
-            elif d.label in slow_labels:
-                slow = True
-        self.yolo_stop = stop
-        self.yolo_slow = slow
+        self.judgment.on_yolo(msg)
 
     def aruco_callback(self, msg: Bool):
-        """aruco_node 의 정지신호(/aruco_stop, 이미 디바운스됨)를 받아 플래그 갱신.
-        aruco_enabled=False 면 즉시 내려 스로틀에 영향을 주지 않는다."""
-        self.last_aruco_time = self.get_clock().now()
-        self.aruco_enabled = bool(self.get_parameter('aruco_enabled').value)
-        self.aruco_stop = bool(msg.data) if self.aruco_enabled else False
-
-    def apply_perception_gate(self, target_throttle):
-        """YOLO/ArUco 인지 기반 스로틀 게이팅(판단). 정지신호가 하나라도 있으면 0,
-        아니면 YOLO 감속만 배율 적용. 각 소스는 stale(노드 사망 등)이면 무시한다
-        (죽은 인지가 브레이크를 영구히 잡지 않게). 조향엔 관여하지 않는다."""
-        now = self.get_clock().now()
-        stop = False
-        slow = False
-        # YOLO: 정지 또는 감속
-        if self.yolo_enabled and self.last_yolo_time is not None:
-            age = (now - self.last_yolo_time).nanoseconds * 1e-9
-            if age <= float(self.get_parameter('yolo_stop_timeout_sec').value):
-                if self.yolo_stop:
-                    stop = True
-                elif self.yolo_slow:
-                    slow = True
-        # ArUco: 정지만
-        if self.aruco_enabled and self.last_aruco_time is not None:
-            age = (now - self.last_aruco_time).nanoseconds * 1e-9
-            if age <= float(self.get_parameter('aruco_stop_timeout_sec').value):
-                if self.aruco_stop:
-                    stop = True
-        if stop:                       # 정지가 최우선
-            return 0.0
-        if slow:
-            return target_throttle * float(self.get_parameter('yolo_slow_scale').value)
-        return target_throttle
+        self.judgment.on_aruco(msg)
 
     # ------------------------------------------------------------------ config
     def load_steer_trim(self):
