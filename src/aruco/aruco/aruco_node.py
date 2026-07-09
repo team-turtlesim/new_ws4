@@ -72,8 +72,12 @@ class ArucoNode(Node):
         # --- 검출 설정 ------------------------------------------------------
         # 기본 사전(원본과 동일 6X6_50). 실시간 교체: ros2 param 은 문자열, 아래 이름 사용.
         self.declare_parameter('aruco_dict', '6X6_50')
-        # 교차검증: 기본 사전 실패 시 백업 사전들로 다시 시도(원본의 '진짜 규격 찾기' 기능).
-        self.declare_parameter('enable_crosscheck', True)
+        # 교차검증(진단용): 기본 사전으로 못 찾으면 백업 사전들로 재시도해 '진짜 규격'을 알려줌.
+        # 단, 마커가 안 보이는 매 프레임마다 사전 4~5개를 전부 다시 돌려 CPU 를 크게 먹는다.
+        # 실측: 켜면 aruco 노드가 CPU 80% 점유 -> YOLO fps 40% 손실(1.96 vs 3.28).
+        # 그래서 기본 OFF. 마커 규격을 모를 때만 잠깐 켜서 로그로 확인하고 다시 끈다.
+        #   ros2 param set /aruco_node enable_crosscheck true   (라이브 토글 가능)
+        self.declare_parameter('enable_crosscheck', False)
         self.declare_parameter('alt_dicts', ['6X6_250', '5X5_50', '5X5_250', '4X4_50'])
 
         # --- 정지신호(판단성) 디바운스 ------------------------------------
@@ -98,13 +102,14 @@ class ArucoNode(Node):
         primary_name = str(self.get_parameter('aruco_dict').value)
         self.primary = build_detector(_dict_const(primary_name))
         self.api_mode = self.primary[0]
+        # 백업 사전 검출기는 항상 만들어 둔다(생성 비용은 시작 시 1회, 아주 쌈).
+        # 실제로 '쓸지'는 매 프레임 enable_crosscheck 를 다시 읽어 결정 -> 라이브 토글 가능.
         self.alt = []
-        if bool(self.get_parameter('enable_crosscheck').value):
-            for name in list(self.get_parameter('alt_dicts').value):
-                try:
-                    self.alt.append((name, build_detector(_dict_const(str(name)))))
-                except Exception as exc:
-                    self.get_logger().warning(f'alt dict {name} 무시: {exc}')
+        for name in list(self.get_parameter('alt_dicts').value):
+            try:
+                self.alt.append((name, build_detector(_dict_const(str(name)))))
+            except Exception as exc:
+                self.get_logger().warning(f'alt dict {name} 무시: {exc}')
 
         # --- 디바운스 상태 --------------------------------------------------
         self.seen_count = 0
@@ -139,7 +144,7 @@ class ArucoNode(Node):
                 str(self.get_parameter('marker_id_topic').value),
                 str(self.get_parameter('stop_topic').value),
                 self.debug_topic if self.debug_image else '(disabled)',
-                primary_name, bool(self.alt), len(self.alt),
+                primary_name, bool(self.get_parameter('enable_crosscheck').value), len(self.alt),
                 self.get_parameter('target_marker_id').value,
                 self.get_parameter('stop_on_frames').value,
                 self.get_parameter('go_after_frames').value,
@@ -174,15 +179,18 @@ class ArucoNode(Node):
                 self.get_logger().info('마커 검출 ID=%d' % marker_id, throttle_duration_sec=0.5)
             return
 
-        # 2차(교차검증): 기본 실패했지만 사각형 후보(rejected)가 있으면 백업 사전들로 재시도
-        if self.alt and rejected is not None and len(rejected) > 0:
+        # 2차(교차검증, 기본 OFF): 매 프레임 param 을 다시 읽어 켜졌을 때만 백업 사전들로 재시도.
+        # 켜면 사전 4~5개를 매 프레임 다 돌려 CPU 를 크게 먹으므로 규격 진단할 때만 잠깐 켤 것.
+        if (bool(self.get_parameter('enable_crosscheck').value)
+                and self.alt and rejected is not None and len(rejected) > 0):
             for name, entry in self.alt:
                 a_corners, a_ids, _ = run_detect(entry, equalized)
                 if a_ids is not None:
                     real_id = int(a_ids[0][0])
                     self.publish_id(real_id)
                     if display is not None:
-                        cv2.aruco.drawDetectedMarkers(display, a_corners, a_ids, borderColor=(0, 165, 255))
+                        cv2.aruco.drawDetectedMarkers(
+                            display, a_corners, a_ids, borderColor=(0, 165, 255))
                         cv2.putText(display, '%s  ID=%d (규격 불일치)' % (name, real_id), (20, 40),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2, cv2.LINE_AA)
                     self.publish_overlay(display, msg)
